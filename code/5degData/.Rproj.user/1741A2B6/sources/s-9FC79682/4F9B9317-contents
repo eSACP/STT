@@ -1,0 +1,220 @@
+#########################################################################################
+## 
+## Prepare annual EOBS data at 5 degrees grid resolution
+##
+## 2018-12-20, HAU
+##
+## Revision:
+##
+#########################################################################################
+
+## Preliminaries
+rm(list=ls())
+library(ncdf4)
+library(raster)
+library(fields)
+
+dataDir <- "../../../data/"
+objDir <- "./robj/"
+#season <- "DJF"
+season <- "JJA"
+save.files <- TRUE
+make.plot <- TRUE
+
+## Read data from netcdf file
+file.ncdf <- paste0(dataDir,"tg_EOBS_",season,".nc")
+data.ncdf <- nc_open(file.ncdf)
+
+data <- list()
+data$values <- ncvar_get(data.ncdf, "tg")
+data$lon <- ncvar_get(data.ncdf, "longitude")
+data$lat <- ncvar_get(data.ncdf, "latitude")
+data$time <- ncvar_get(data.ncdf, "time")
+
+## Focus on a smaller region
+ind <- which(data$lon < 40 & data$lon > -12)
+data$values <- data$values[ind,,]
+data$lon <- data$lon[ind]
+ind <- which(data$lat > 36 & data$lat < 72 )
+data$values <- data$values[,ind,]
+data$lat <- data$lat[ind]
+
+## Within new region, identify locations where data are available at all time points
+tmp.s <- array(NA, dim=dim(data$values)[1:2])
+for(i in 1:dim(tmp.s)[1]) {
+  for(j in 1:dim(tmp.s)[2]) {
+    if(sum(is.na(data$values[i,j,]))==0) tmp.s[i,j] <- 1
+  }
+}
+
+## Omit North Africa and two isolated islands north of Scotland
+tmp.s[which(data$lon>0 & data$lon<5),which(data$lat<38)] <- NA
+tmp.s[which(data$lon<0),which(data$lat>60)] <- NA
+
+
+## Create a data structure that has all NAs removed
+S <- sum(!is.na(tmp.s)) ## number of grid points considered
+T.month <- length(data$time)
+data.all <- list()
+data.all$lon <- rep(NA,S)
+data.all$lat <- rep(NA,S)
+data.all$y <- array(NA, dim = c(T.month,S)) 
+data.all$t <- array(NA, dim = c(T.month,S)) 
+k <- 1
+for(i in 1:dim(tmp.s)[1])
+  {
+    for(j in 1:dim(tmp.s)[2])
+      {
+        if(!is.na(tmp.s[i,j]))
+          {
+            data.all$lon[k] <- data$lon[i]
+            data.all$lat[k] <- data$lat[j]
+            if (season=="JJA")
+              data.all$y[,k] <- data$values[i,j,]
+            if (season=="DJF") {
+              #For the winter season, monthly data are from Jan 1950 through Dec 2015 (195 months).
+              #In the generation of annunal means, we only have two months available for 1950, and one month for 2015.
+              #We construct an annual series that cover the years 1950-2014 (65 years).
+              #In order to stick with the structure of the summer data series, we augment the winter series in front with
+              #an element equal to the mean of the Jan 1950 and Feb 1950 values, and skip the last entry (Dec 2015).
+              tmp.y <- data$values[i,j,]
+              data.all$y[,k] <- c(mean(tmp.y[1:2]),tmp.y[1:(T.month-1)])
+            }
+            data.all$t[,k] <- 1:T.month
+            k <-  k + 1
+          }
+      }
+  }
+
+
+## Generate annual mean temperatures from monthly means
+T.ann <- T.month/3
+data.annual <- list()
+data.annual$lon <- data.all$lon
+data.annual$lat <- data.all$lat
+data.annual$y <- array(NA,dim=c(T.ann,S))
+data.annual$t <- array(NA,dim=c(T.ann,S))
+for (i in 1:T.ann) {
+  data.annual$y[i,] <- apply(data.all$y[((i-1)*3+1):(i*3),],2,mean)
+  data.annual$t[i,] <- i
+}
+if (save.files) save(data.annual,file=paste0(objDir,season,"_data.annual.RData"))
+
+## Verification plot...
+#if(make.plot){
+#  par(mfrow=c(1,1))
+#  quilt.plot(x=data.annual$lon,y=data.annual$lat,z=apply(data.annual$y,2,mean,na.rm=T),nx=184,ny=128,add=FALSE)
+#  title(main=paste0(season,' annual mean temperature [degC]'))
+#  map("world",xlim=c(-20,50), ylim=c(15,80),col="gray45",fill=FALSE,add=TRUE)
+#  
+#  to.plot=apply(data.annual$y,2,mean,na.rm=T)
+#  m.min <- min(to.plot)
+#  m.max <- max(to.plot)
+#  ColorRamp <- tim.colors(64) # cm.colors(256) #terrain.colors(256)      # Same as used in quilt.plot
+#  ColorLevels <- seq(m.min, m.max, length=length(ColorRamp))
+#  L <- length(to.plot)
+#  col.plot <- rep(NA,L)
+#  for(i in 1:L) col.plot[i] <- which.min(abs(ColorLevels-to.plot[i]))
+#  points(data.annual$lon,data.annual$lat,col=ColorRamp[col.plot],pch=16,cex=.1)
+#}
+
+
+## Aggregate temperatures to coarser resolution in the spatial grid
+## Original resolution is 0.25deg lon x 0.25deg lat
+## The aggregate() function parameter 'fact' specifies the level of the aggregation (how many times),
+## eg fact=1 results in original (0.25deg x 0.25deg) output data, fact=2 results in 0.5deg x 0.5deg output data, 
+## fact=4 results in 1deg x 1deg output data, fact=2*5 gives 2.5deg x 2.5deg output resolution, 
+## fact=4*5 gives 5deg x 5deg resolution.
+## To produce an aggregate for whole Europe (ie condensed into one single point), put fact=201.
+data.agg <- list()
+data.agg$y <- NULL
+data.agg$t <- NULL
+for (i in 1:T.ann) {
+  
+  tmp <- data.frame(lon=data.annual$lon,lat=data.annual$lat,y=data.annual$y[i,],t=data.annual$t[i,])
+  coordinates(tmp) <- ~ lon + lat
+  gridded(tmp) <- TRUE
+  
+  # Stack each variable as a band in the raster:
+  r <- raster(tmp,layer=1)
+  r <- stack(r,raster(tmp,layer=2))
+  tmp <- r
+  
+  # Aggregate to wanted resolution (fact>1)
+  tmp <- aggregate(tmp,fact=4*5,fun=mean,na.rm=TRUE)       # Generate grid cells as long as they have at least one non-NA contribution
+  
+  # Get it back to a dataframe
+  coords.agg <- as.matrix(coordinates(tmp))
+  df <- data.frame(lon=coords.agg[,1],lat=coords.agg[,2],as.data.frame(tmp))
+
+  data.agg$lon <- df$lon
+  data.agg$lat <- df$lat
+  data.agg$y <- rbind(data.agg$y,df$y)
+  data.agg$t <- rbind(data.agg$t,df$t)
+  
+}
+data.agg$y <- as.matrix(data.agg$y,nrow=T.ann)
+data.agg$t <- as.matrix(data.agg$t,nrow=T.ann)
+
+## Remove grid cells with all NAs (corrsponding to no original 0.25deg cell contributions)
+idx <- apply(is.na(as.matrix(data.agg$y)),2,sum)==0
+idx2 <- apply(as.matrix(data.agg$y[,idx]),2,sum)==0
+idx[idx][idx2] <- FALSE
+data.agg$lon <- data.agg$lon[idx]
+data.agg$lat <- data.agg$lat[idx]
+data.agg$y <- data.agg$y[,idx]
+data.agg$t <- data.agg$t[,idx]
+L <- dim(as.matrix(data.agg$y))[2]
+
+## Verification plot...
+if (make.plot) {
+  par(mfrow=c(1,1))
+  quilt.plot(x=data.annual$lon,y=data.annual$lat,z=apply(data.annual$y,2,mean,na.rm=T),nx=184,ny=128,add=FALSE)
+  title(main=paste0(season,' annual mean temperature [degC]'))
+  map("world",xlim=c(-20,50), ylim=c(15,80),col="gray45",fill=FALSE,add=TRUE)
+
+  to.plot=apply(as.matrix(data.agg$y),2,mean,na.rm=T)
+  m.min <- min(to.plot)
+  m.max <- max(to.plot)
+  ColorRamp <- tim.colors(64) # cm.colors(256) #terrain.colors(256)      # Same as used in quilt.plot
+  ColorLevels <- seq(m.min, m.max, length=length(ColorRamp))
+  col.plot <- rep(NA,L)
+  for(i in 1:L) col.plot[i] <- which.min(abs(ColorLevels-to.plot[i]))
+  points(data.agg$lon,data.agg$lat,col=1,pch=16,cex=.75)  #5deg res
+}
+
+
+#########################################################################################
+## Data in INLA compatible data.frame representation
+data.inla <- data.frame(t.vec=as.vector(t(data.agg$t)),
+                        y.vec=as.vector(t(data.agg$y)),
+                        lon.vec=rep(data.agg$lon,T.ann),
+                        lat.vec=rep(data.agg$lat,T.ann),
+                        station.id=rep(1:L,T.ann),
+                        time=rep(1:T.ann,each=L))
+
+## Centering time variable to correspond to a non-intercept model of the anomalies.
+## Necessary since the non-intercept model gets the slope wrong if the x axis starts at t=0 
+## Rather, the y-value at t=0.5 should be translated to t=0 (can be obtained by allowing for an intercept in the model),
+## alternatively by translating the x-axis so that the mean x-value corresponds to t=0 (t.new=t-mean(t)).
+t.min <- min(data.inla$t.vec)
+t.max <- max(data.inla$t.vec)
+data.inla$t.vec <- (data.inla$t.vec-t.min)/(t.max-t.min)
+data.inla$t.vec <- data.inla$t.vec-mean(data.inla$t.vec)
+data.inla$t.vec <- data.inla$t.vec*(T.ann/10)          # leaves estimated trend as degC/decade
+
+## For each location, convert original scale temperatures into (standardized) anomalies
+## Consequently, global spatiotemporal mean equals zero as well
+station.ids <- unique(data.inla$station.id)
+for (i in 1:length(station.ids)) {
+  y.loc <- data.inla[data.inla$station.id==station.ids[i],]$y.vec
+  y.anomaly <- as.vector(scale(y.loc,center=TRUE,scale=TRUE))                 # mean-centered and standardized anomalies
+  data.inla[data.inla$station.id==station.ids[i],]$y.vec <- y.anomaly
+}
+
+## Save regular grid data to file
+#if (save.files) save(data.agg,file=paste0(dataDir,season,"_data.agg.5deg.RData"))
+
+## Save gridded temperature data object to file
+if (save.files) save(data.inla,file=paste0(objDir,season,"_data.inla.5deg.RData"))
+
